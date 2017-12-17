@@ -1,0 +1,1583 @@
+/* $OpenBSD: ssh-agent.c,v 1.172 2011/06/03 01:37:40 dtucker Exp $ */
+/*
+ * Author: Tatu Ylonen <ylo@cs.hut.fi>
+ * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
+ *                    All rights reserved
+ * The authentication agent program.
+ *
+ * As far as I am concerned, the code I have written for this software
+ * can be used freely for any purpose.  Any derived versions of this
+ * software must be clearly marked as such, and if the derived work is
+ * incompatible with the protocol description in the RFC file, it must be
+ * called by a name other than "ssh" or "Secure Shell".
+ *
+ * Copyright (c) 2000, 2001 Markus Friedl.  All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include <sys/types.h>
+#include <sys/time.h>
+#include <sys/queue.h>
+#include <sys/resource.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/param.h>
+
+#include <openssl/evp.h>
+#include <openssl/md5.h>
+
+#include <errno.h>
+#include <fcntl.h>
+#include <paths.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "xmalloc.h"
+#include "ssh.h"
+#include "rsa.h"
+#include "sshbuf.h"
+#include "sshbuf.h"
+#include "key.h"
+#include "authfd.h"
+#include "compat.h"
+#include "log.h"
+#include "misc.h"
+#include "err.h"
+
+#ifdef ENABLE_PKCS11
+#include "ssh-pkcs11.h"
+#endif
+
+typedef enum {
+	AUTH_UNUSED,
+	AUTH_SOCKET,
+	AUTH_CONNECTION
+} sock_type;
+
+typedef struct {
+	int fd;
+	sock_type type;
+	struct sshbuf *input;
+	struct sshbuf *output;
+	struct sshbuf *request;
+} SocketEntry;
+
+u_int sockets_alloc = 0;
+SocketEntry *sockets = NULL;
+
+typedef struct identity {
+	TAILQ_ENTRY(identity) next;
+	struct sshkey *key;
+	char *comment;
+	char *provider;
+	u_int death;
+	u_int confirm;
+} Identity;
+
+typedef struct {
+	int nentries;
+	TAILQ_HEAD(idqueue, identity) idlist;
+} Idtab;
+
+/* private key table, one per protocol version */
+Idtab idtable[3];
+
+int max_fd = 0;
+
+/* pid of shell == parent of agent */
+pid_t parent_pid = -1;
+u_int parent_alive_interval = 0;
+
+/* pathname and directory for AUTH_SOCKET */
+char socket_name[MAXPATHLEN];
+char socket_dir[MAXPATHLEN];
+
+/* locking */
+int locked = 0;
+char *lock_passwd = NULL;
+
+extern char *__progname;
+
+/* Default lifetime (0 == forever) */
+static int lifetime = 0;
+
+static void
+close_socket(SocketEntry *e)
+{
+	close(e->fd);
+	e->fd = -1;
+	e->type = AUTH_UNUSED;
+	sshbuf_free(e->input);
+	sshbuf_free(e->output);
+	sshbuf_free(e->request);
+}
+
+static void
+idtab_init(void)
+{
+	int i;
+
+	for (i = 0; i <=2; i++) {
+		TAILQ_INIT(&idtable[i].idlist);
+		idtable[i].nentries = 0;
+	}
+}
+
+/* return private key table for requested protocol version */
+static Idtab *
+idtab_lookup(int version)
+{
+	if (version < 1 || version > 2)
+		fatal("internal error, bad protocol version %d", version);
+	return &idtable[version];
+}
+
+static void
+free_identity(Identity *id)
+{
+	sshkey_free(id->key);
+	if (id->provider != NULL)
+		xfree(id->provider);
+	xfree(id->comment);
+	xfree(id);
+}
+
+/* return matching private key for given public key */
+static Identity *
+lookup_identity(struct sshkey *key, int version)
+{
+	Identity *id;
+
+	Idtab *tab = idtab_lookup(version);
+	TAILQ_FOREACH(id, &tab->idlist, next) {
+		if (sshkey_equal(key, id->key))
+			return (id);
+	}
+	return (NULL);
+}
+
+/* Check confirmation of keysign request */
+static int
+confirm_key(Identity *id)
+{
+	char *p;
+	int ret = -1;
+
+	p = sshkey_fingerprint(id->key, SSH_FP_MD5, SSH_FP_HEX);
+	if (ask_permission("Allow use of key %s?\nKey fingerprint %s.",
+	    id->comment, p))
+		ret = 0;
+	xfree(p);
+
+	return (ret);
+}
+
+static void
+send_status(SocketEntry *e, int success)
+{
+	int r;
+
+	if ((r = sshbuf_put_u32(e->output, 1)) != 0 ||
+	    (r = sshbuf_put_u8(e->output, success ?
+	    SSH_AGENT_SUCCESS : SSH_AGENT_FAILURE)) != 0)
+		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+}
+
+/* send list of supported public keys to 'client' */
+static void
+process_request_identities(SocketEntry *e, int version)
+{
+	Idtab *tab = idtab_lookup(version);
+	Identity *id;
+	struct sshbuf *msg;
+	int r;
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal("%s: sshbuf_new failed", __func__);
+	if ((r = sshbuf_put_u8(msg, (version == 1) ?
+	    SSH_AGENT_RSA_IDENTITIES_ANSWER :
+	    SSH2_AGENT_IDENTITIES_ANSWER)) != 0 ||
+	    (r = sshbuf_put_u32(msg, tab->nentries)) != 0)
+		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+	TAILQ_FOREACH(id, &tab->idlist, next) {
+		if (id->key->type == KEY_RSA1) {
+			if ((r = sshbuf_put_u32(msg,
+			    BN_num_bits(id->key->rsa->n))) != 0 ||
+			    (r = sshbuf_put_bignum1(msg,
+			    id->key->rsa->e)) != 0 ||
+			    (r = sshbuf_put_bignum1(msg,
+			    id->key->rsa->n)) != 0)
+				fatal("%s: buffer error: %s",
+				    __func__, ssh_err(r));
+		} else {
+			u_char *blob;
+			size_t blen;
+
+			if ((r = sshkey_to_blob(id->key, &blob, &blen)) != 0) {
+				error("%s: sshkey_to_blob: %s", __func__,
+				    ssh_err(r));
+				continue;
+			}
+			if ((r = sshbuf_put_string(msg, blob, blen)) != 0)
+				fatal("%s: buffer error: %s",
+				    __func__, ssh_err(r));
+			xfree(blob);
+		}
+		if ((r = sshbuf_put_cstring(msg, id->comment)) != 0)
+			fatal("%s: buffer error: %s", __func__, ssh_err(r));
+	}
+	if ((r = sshbuf_put_stringb(e->output, msg)) != 0)
+		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+	sshbuf_free(msg);
+}
+
+/* ssh1 only */
+static void
+process_authentication_challenge1(SocketEntry *e)
+{
+	u_char buf[32], mdbuf[16], session_id[16];
+	u_int response_type;
+	BIGNUM *challenge;
+	Identity *id;
+	int r, len;
+	struct sshbuf *msg;
+	MD5_CTX md;
+	struct sshkey *key;
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal("%s: sshbuf_new failed", __func__);
+	if ((key = sshkey_new(KEY_RSA1)) == NULL)
+		fatal("%s: sshkey_new failed", __func__);
+	if ((challenge = BN_new()) == NULL)
+		fatal("%s: BN_new failed", __func__);
+
+	if ((r = sshbuf_get_u32(e->request, NULL)) != 0 || /* ignored */
+	    (r = sshbuf_get_bignum1(e->request, key->rsa->e)) != 0 ||
+	    (r = sshbuf_get_bignum1(e->request, key->rsa->n)) != 0 ||
+	    (r = sshbuf_get_bignum1(e->request, challenge)))
+		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+
+	/* Only protocol 1.1 is supported */
+	if (sshbuf_len(e->request) == 0)
+		goto failure;
+	if ((r = sshbuf_get(e->request, session_id, sizeof(session_id))) != 0 ||
+	    (r = sshbuf_get_u32(e->request, &response_type)) != 0)
+		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+	if (response_type != 1)
+		goto failure;
+
+	id = lookup_identity(key, 1);
+	if (id != NULL && (!id->confirm || confirm_key(id) == 0)) {
+		struct sshkey *private = id->key;
+		/* Decrypt the challenge using the private key. */
+		if ((r = rsa_private_decrypt(challenge, challenge,
+		    private->rsa) != 0)) {
+			fatal("%s: rsa_public_encrypt: %s", __func__,
+			    ssh_err(r));
+			goto failure;
+		}
+
+		/* The response is MD5 of decrypted challenge plus session id */
+		len = BN_num_bytes(challenge);
+		if (len <= 0 || len > 32) {
+			logit("%s: bad challenge length %d", __func__, len);
+			goto failure;
+		}
+		memset(buf, 0, 32);
+		BN_bn2bin(challenge, buf + 32 - len);
+		MD5_Init(&md);
+		MD5_Update(&md, buf, 32);
+		MD5_Update(&md, session_id, 16);
+		MD5_Final(mdbuf, &md);
+
+		/* Send the response. */
+		if ((r = sshbuf_put_u8(msg, SSH_AGENT_RSA_RESPONSE)) != 0 ||
+		    (r = sshbuf_put(msg, mdbuf, sizeof(mdbuf))) != 0)
+			fatal("%s: buffer error: %s", __func__, ssh_err(r));
+		goto send;
+	}
+
+ failure:
+	/* Unknown identity or protocol error.  Send failure. */
+	if ((r = sshbuf_put_u8(msg, SSH_AGENT_FAILURE)) != 0)
+		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+ send:
+	if ((r = sshbuf_put_stringb(e->output, msg)) != 0)
+		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+	sshkey_free(key);
+	BN_clear_free(challenge);
+	sshbuf_free(msg);
+}
+
+/* ssh2 only */
+static void
+process_sign_request2(SocketEntry *e)
+{
+	u_char *blob, *data, *signature = NULL;
+	size_t blen, dlen, slen = 0;
+	u_int compat = 0;
+	int r, ok = -1, flags;
+	struct sshbuf *msg;
+	struct sshkey *key;
+
+	if ((r = sshbuf_get_string(e->request, &blob, &blen)) != 0 ||
+	    (r = sshbuf_get_string(e->request, &data, &dlen)) != 0 ||
+	    (r = sshbuf_get_u32(e->request, &flags)) != 0)
+		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+	if (flags & SSH_AGENT_OLD_SIGNATURE)
+		compat = SSH_BUG_SIGBLOB;
+
+	if ((ok = sshkey_from_blob(blob, blen, &key)) != 0)
+		error("%s: cannot parse key blob: %s", __func__, ssh_err(ok));
+	else {
+		Identity *id = lookup_identity(key, 2);
+		if (id != NULL && (!id->confirm || confirm_key(id) == 0)) {
+			if ((ok = sshkey_sign(id->key, &signature, &slen,
+			    data, dlen, compat)) != 0)
+				error("%s: sshkey_sign: %s",
+				    __func__, ssh_err(ok));
+		}
+		sshkey_free(key);
+	}
+	if ((msg = sshbuf_new()) == NULL)
+		fatal("%s: sshbuf_new failed", __func__);
+	if (ok == 0) {
+		if ((r = sshbuf_put_u8(msg, SSH2_AGENT_SIGN_RESPONSE)) != 0 ||
+		    (r = sshbuf_put_string(msg, signature, slen)) != 0)
+			fatal("%s: buffer error: %s", __func__, ssh_err(r));
+	} else if ((r = sshbuf_put_u8(msg, SSH_AGENT_FAILURE)) != 0)
+		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+
+	if ((r = sshbuf_put_stringb(e->output, msg)) != 0)
+		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+
+	sshbuf_free(msg);
+	xfree(data);
+	xfree(blob);
+	if (signature != NULL)
+		xfree(signature);
+}
+
+/* shared */
+static void
+process_remove_identity(SocketEntry *e, int version)
+{
+	size_t blen;
+	u_int bits;
+	int r, success = 0;
+	struct sshkey *key = NULL;
+	u_char *blob;
+
+	switch (version) {
+	case 1:
+		if ((key = sshkey_new(KEY_RSA1)) == NULL) {
+			error("%s: sshkey_new failed", __func__);
+			return;
+		}
+		if ((r = sshbuf_get_u32(e->request, &bits)) != 0 ||
+		    (r = sshbuf_get_bignum1(e->request, key->rsa->e)) != 0 ||
+		    (r = sshbuf_get_bignum1(e->request, key->rsa->n)) != 0)
+			fatal("%s: buffer error: %s", __func__, ssh_err(r));
+
+		if (bits != sshkey_size(key))
+			logit("Warning: identity keysize mismatch: "
+			    "actual %u, announced %u",
+			    sshkey_size(key), bits);
+		break;
+	case 2:
+		if ((r = sshbuf_get_string(e->request, &blob, &blen)) != 0)
+			fatal("%s: buffer error: %s", __func__, ssh_err(r));
+		if ((r = sshkey_from_blob(blob, blen, &key)) != 0)
+			error("%s: sshkey_from_blob failed: %s",
+			    __func__, ssh_err(r));
+		xfree(blob);
+		break;
+	}
+	if (key != NULL) {
+		Identity *id = lookup_identity(key, version);
+		if (id != NULL) {
+			/*
+			 * We have this key.  Free the old key.  Since we
+			 * don't want to leave empty slots in the middle of
+			 * the array, we actually free the key there and move
+			 * all the entries between the empty slot and the end
+			 * of the array.
+			 */
+			Idtab *tab = idtab_lookup(version);
+			if (tab->nentries < 1)
+				fatal("process_remove_identity: "
+				    "internal error: tab->nentries %d",
+				    tab->nentries);
+			TAILQ_REMOVE(&tab->idlist, id, next);
+			free_identity(id);
+			tab->nentries--;
+			success = 1;
+		}
+		sshkey_free(key);
+	}
+	send_status(e, success);
+}
+
+static void
+process_remove_all_identities(SocketEntry *e, int version)
+{
+	Idtab *tab = idtab_lookup(version);
+	Identity *id;
+
+	/* Loop over all identities and clear the keys. */
+	for (id = TAILQ_FIRST(&tab->idlist); id;
+	    id = TAILQ_FIRST(&tab->idlist)) {
+		TAILQ_REMOVE(&tab->idlist, id, next);
+		free_identity(id);
+	}
+
+	/* Mark that there are no identities. */
+	tab->nentries = 0;
+
+	/* Send success. */
+	send_status(e, 1);
+}
+
+/* removes expired keys and returns number of seconds until the next expiry */
+static u_int
+reaper(void)
+{
+	u_int deadline = 0, now = time(NULL);
+	Identity *id, *nxt;
+	int version;
+	Idtab *tab;
+
+	for (version = 1; version < 3; version++) {
+		tab = idtab_lookup(version);
+		for (id = TAILQ_FIRST(&tab->idlist); id; id = nxt) {
+			nxt = TAILQ_NEXT(id, next);
+			if (id->death == 0)
+				continue;
+			if (now >= id->death) {
+				debug("expiring key '%s'", id->comment);
+				TAILQ_REMOVE(&tab->idlist, id, next);
+				free_identity(id);
+				tab->nentries--;
+			} else
+				deadline = (deadline == 0) ? id->death :
+				    MIN(deadline, id->death);
+		}
+	}
+	if (deadline == 0 || deadline <= now)
+		return 0;
+	else
+		return (deadline - now);
+}
+
+static int
+agent_decode_rsa1(struct sshbuf *m, struct sshkey **kp)
+{
+	struct sshkey *k = NULL;
+	int r = SSH_ERR_INTERNAL_ERROR;
+
+	*kp = NULL;
+	if ((k = sshkey_new_private(KEY_RSA1)) == NULL)
+		return SSH_ERR_ALLOC_FAIL;
+
+	if ((r = sshbuf_get_u32(m, NULL)) != 0 ||		/* ignored */
+	    (r = sshbuf_get_bignum1(m, k->rsa->n)) != 0 ||
+	    (r = sshbuf_get_bignum1(m, k->rsa->e)) != 0 ||
+	    (r = sshbuf_get_bignum1(m, k->rsa->d)) != 0 ||
+	    (r = sshbuf_get_bignum1(m, k->rsa->iqmp)) != 0 ||
+	    /* SSH1 and SSL have p and q swapped */
+	    (r = sshbuf_get_bignum1(m, k->rsa->q)) != 0 ||	/* p */
+	    (r = sshbuf_get_bignum1(m, k->rsa->p)) != 0) 	/* q */
+		goto out;
+
+	/* Generate additional parameters */
+	if ((r = rsa_generate_additional_parameters(k->rsa)) != 0)
+		goto out;
+	if (RSA_blinding_on(k->rsa, NULL) != 1) {
+		r = SSH_ERR_LIBCRYPTO_ERROR;
+		goto out;
+	}
+
+	r = 0; /* success */
+ out:
+	if (r == 0)
+		*kp = k;
+	else
+		sshkey_free(k);
+	return r;
+}
+
+static int
+agent_decode_rsa(struct sshbuf *m, const char *typename,
+    int type, struct sshkey **kp)
+{
+	struct sshkey *k = NULL;
+	int r = SSH_ERR_INTERNAL_ERROR;
+
+	*kp = NULL;
+	if ((k = sshkey_new_private(type)) == NULL)
+		return SSH_ERR_ALLOC_FAIL;
+
+	if ((r = sshbuf_get_bignum2(m, k->rsa->n)) != 0 ||
+	    (r = sshbuf_get_bignum2(m, k->rsa->e)) != 0 ||
+	    (r = sshbuf_get_bignum2(m, k->rsa->d)) != 0 ||
+	    (r = sshbuf_get_bignum2(m, k->rsa->iqmp)) != 0 ||
+	    (r = sshbuf_get_bignum2(m, k->rsa->p)) != 0 ||
+	    (r = sshbuf_get_bignum2(m, k->rsa->q)) != 0)
+		goto out;
+
+	/* Generate additional parameters */
+	if ((r = rsa_generate_additional_parameters(k->rsa)) != 0)
+		goto out;
+	if (RSA_blinding_on(k->rsa, NULL) != 1) {
+		r = SSH_ERR_LIBCRYPTO_ERROR;
+		goto out;
+	}
+
+	r = 0; /* success */
+ out:
+	if (r == 0)
+		*kp = k;
+	else
+		sshkey_free(k);
+	return r;
+}
+
+static int
+agent_decode_rsa_cert(struct sshbuf *m, const char *typename,
+    int type, struct sshkey **kp)
+{
+	struct sshkey *k = NULL;
+	int r = SSH_ERR_INTERNAL_ERROR;
+	u_char *blob = NULL;
+	size_t len;
+
+	*kp = NULL;
+
+	if ((r = sshbuf_get_string(m, &blob, &len)) != 0 ||
+	    (r = sshkey_from_blob(blob, len, &k)) != 0 ||
+	    (r = sshkey_add_private(k)) != 0 ||
+	    (r = sshbuf_get_bignum2(m, k->rsa->d) != 0) ||
+	    (r = sshbuf_get_bignum2(m, k->rsa->iqmp) != 0) ||
+	    (r = sshbuf_get_bignum2(m, k->rsa->p) != 0) ||
+	    (r = sshbuf_get_bignum2(m, k->rsa->q) != 0))
+		goto out;
+
+	/* Generate additional parameters */
+	if ((r = rsa_generate_additional_parameters(k->rsa)) != 0)
+		goto out;
+	if (RSA_blinding_on(k->rsa, NULL) != 1) {
+		r = SSH_ERR_LIBCRYPTO_ERROR;
+		goto out;
+	}
+
+	r = 0; /* success */
+ out:
+	if (blob) {
+		bzero(blob, len);
+		free(blob);
+	}
+	if (r == 0)
+		*kp = k;
+	else
+		sshkey_free(k);
+	return r;
+}
+
+static int
+agent_decode_dsa(struct sshbuf *m, const char *typename,
+    int type, struct sshkey **kp)
+{
+	struct sshkey *k = NULL;
+	int r = SSH_ERR_INTERNAL_ERROR;
+
+	*kp = NULL;
+	if ((k = sshkey_new_private(type)) == NULL)
+		return SSH_ERR_ALLOC_FAIL;
+
+	if ((r = sshbuf_get_bignum2(m, k->dsa->p)) != 0 ||
+	    (r = sshbuf_get_bignum2(m, k->dsa->q)) != 0 ||
+	    (r = sshbuf_get_bignum2(m, k->dsa->g)) != 0 ||
+	    (r = sshbuf_get_bignum2(m, k->dsa->pub_key)) != 0 ||
+	    (r = sshbuf_get_bignum2(m, k->dsa->priv_key)) != 0)
+		goto out;
+
+	r = 0; /* success */
+ out:
+	if (r == 0)
+		*kp = k;
+	else
+		sshkey_free(k);
+	return r;
+}
+
+static int
+agent_decode_dsa_cert(struct sshbuf *m, const char *typename,
+    int type, struct sshkey **kp)
+{
+	struct sshkey *k = NULL;
+	int r = SSH_ERR_INTERNAL_ERROR;
+	u_char *blob = NULL;
+	size_t len;
+
+	*kp = NULL;
+
+	if ((r = sshbuf_get_string(m, &blob, &len)) != 0 ||
+	    (r = sshkey_from_blob(blob, len, &k)) != 0 ||
+	    (r = sshkey_add_private(k)) != 0 ||
+	    (r = sshbuf_get_bignum2(m, k->dsa->priv_key)) != 0)
+		goto out;
+
+	r = 0; /* success */
+ out:
+	if (blob) {
+		bzero(blob, len);
+		free(blob);
+	}
+	if (r == 0)
+		*kp = k;
+	else
+		sshkey_free(k);
+	return r;
+}
+
+static int
+agent_decode_ecdsa(struct sshbuf *m, const char *typename,
+    int type, struct sshkey **kp)
+{
+	struct sshkey *k = NULL;
+	int r = SSH_ERR_INTERNAL_ERROR;
+	char *curve = NULL;
+	BIGNUM *exponent = NULL;
+
+	*kp = NULL;
+	if ((k = sshkey_new_private(type)) == NULL)
+		return SSH_ERR_ALLOC_FAIL;
+	if ((k->ecdsa_nid = sshkey_ecdsa_nid_from_name(typename)) == -1) {
+		r = SSH_ERR_INVALID_ARGUMENT;
+		goto out;
+	}
+	if ((r = sshbuf_get_cstring(m, &curve, NULL)) != 0)
+		goto out;
+	if (k->ecdsa_nid != sshkey_curve_name_to_nid(curve)) {
+		r = SSH_ERR_EC_CURVE_MISMATCH;
+		goto out;
+	}
+	if ((k->ecdsa = EC_KEY_new_by_curve_name(k->ecdsa_nid)) == NULL ||
+	    (exponent = BN_new()) == NULL) {
+		r = SSH_ERR_LIBCRYPTO_ERROR;
+		goto out;
+	}
+	if ((r = sshbuf_get_eckey(m, k->ecdsa)) != 0 ||
+	    (r = sshbuf_get_bignum2(m, exponent)))
+		goto out;
+	if (EC_KEY_set_private_key(k->ecdsa, exponent) != 1) {
+		r = SSH_ERR_LIBCRYPTO_ERROR;
+		goto out;
+	}
+	if ((r = sshkey_ec_validate_public(EC_KEY_get0_group(k->ecdsa),
+	    EC_KEY_get0_public_key(k->ecdsa)) != 0) ||
+	    (r = sshkey_ec_validate_private(k->ecdsa)) != 0)
+		goto out;
+
+	r = 0; /* success */
+ out:
+	if (curve) {
+		bzero(curve, strlen(curve));
+		free(curve);
+	}
+	if (exponent)
+		BN_clear_free(exponent);
+	if (r == 0)
+		*kp = k;
+	else
+		sshkey_free(k);
+	return r;
+}
+
+static int
+agent_decode_ecdsa_cert(struct sshbuf *m, const char *typename,
+    int type, struct sshkey **kp)
+{
+	struct sshkey *k = NULL;
+	int r = SSH_ERR_INTERNAL_ERROR;
+	u_char *blob = NULL;
+	size_t len;
+	BIGNUM *exponent = NULL;
+
+	*kp = NULL;
+
+	if ((exponent = BN_new()) == NULL)
+		return SSH_ERR_ALLOC_FAIL;
+
+	if ((r = sshbuf_get_string(m, &blob, &len)) != 0 ||
+	    (r = sshkey_from_blob(blob, len, &k)) != 0 ||
+	    (r = sshkey_add_private(k)) != 0 ||
+	    (r = sshbuf_get_bignum2(m, exponent)) != 0)
+		goto out;
+
+	if (EC_KEY_set_private_key(k->ecdsa, exponent) != 1) {
+		r = SSH_ERR_LIBCRYPTO_ERROR;
+		goto out;
+	}
+	if ((r = sshkey_ec_validate_public(EC_KEY_get0_group(k->ecdsa),
+	    EC_KEY_get0_public_key(k->ecdsa)) != 0) ||
+	    (r = sshkey_ec_validate_private(k->ecdsa)) != 0)
+		goto out;
+
+	r = 0; /* success */
+ out:
+	if (exponent)
+		BN_clear_free(exponent);
+	if (blob) {
+		bzero(blob, len);
+		free(blob);
+	}
+	if (r == 0)
+		*kp = k;
+	else
+		sshkey_free(k);
+	return r;
+}
+
+static void
+process_add_identity(SocketEntry *e, int version)
+{
+	Idtab *tab = idtab_lookup(version);
+	Identity *id;
+	int type, success = 0, death = 0, confirm = 0;
+	char *type_name = NULL, *comment = NULL;
+	struct sshkey *k = NULL;
+	u_char ctype;
+	int r = SSH_ERR_INTERNAL_ERROR;
+
+	switch (version) {
+	case 1:
+		r = agent_decode_rsa1(e->request, &k);
+		break;
+	case 2:
+		if ((r = sshbuf_get_cstring(e->request, &type_name, NULL)) != 0)
+			break;
+		type = sshkey_type_from_name(type_name);
+		switch (type) {
+		case KEY_DSA:
+			r = agent_decode_dsa(e->request, type_name, type, &k);
+			break;
+		case KEY_DSA_CERT_V00:
+		case KEY_DSA_CERT:
+			r = agent_decode_dsa_cert(e->request, type_name,
+			    type, &k);
+			break;
+		case KEY_ECDSA:
+			r = agent_decode_ecdsa(e->request, type_name, type, &k);
+			break;
+		case KEY_ECDSA_CERT:
+			r = agent_decode_ecdsa_cert(e->request, type_name,
+			    type, &k);
+			break;
+		case KEY_RSA:
+			r = agent_decode_rsa(e->request, type_name, type, &k);
+			break;
+		case KEY_RSA_CERT_V00:
+		case KEY_RSA_CERT:
+			r = agent_decode_rsa_cert(e->request, type_name,
+			    type, &k);
+			break;
+		default:
+			r = SSH_ERR_KEY_TYPE_UNKNOWN;
+			break;
+		}
+		break;
+	}
+	free(type_name);
+	if (r != 0 || k == NULL ||
+	    (r = sshbuf_get_cstring(e->request, &comment, NULL)) != 0) {
+		error("%s: decode private key: %s", __func__, ssh_err(r));
+		goto err;
+	}
+
+	while (sshbuf_len(e->request)) {
+		if ((r = sshbuf_get_u8(e->request, &ctype)) != 0) {
+			error("%s: buffer error: %s", __func__, ssh_err(r));
+			goto err;
+		}
+		switch (ctype) {
+		case SSH_AGENT_CONSTRAIN_LIFETIME:
+			if ((r = sshbuf_get_u32(e->request, &death)) != 0) {
+				error("%s: bad lifetime constraint: %s",
+				    __func__, ssh_err(r));
+				goto err;
+			}
+			death += time(NULL);
+			break;
+		case SSH_AGENT_CONSTRAIN_CONFIRM:
+			confirm = 1;
+			break;
+		default:
+			error("%s: Unknown constraint %d", __func__, ctype);
+ err:
+			sshbuf_reset(e->request);
+			free(comment);
+			sshkey_free(k);
+			goto send;
+		}
+	}
+
+	success = 1;
+	if (lifetime && !death)
+		death = time(NULL) + lifetime;
+	if ((id = lookup_identity(k, version)) == NULL) {
+		id = xcalloc(1, sizeof(Identity));
+		id->key = k;
+		TAILQ_INSERT_TAIL(&tab->idlist, id, next);
+		/* Increment the number of identities. */
+		tab->nentries++;
+	} else {
+		sshkey_free(k);
+		xfree(id->comment);
+	}
+	id->comment = comment;
+	id->death = death;
+	id->confirm = confirm;
+send:
+	send_status(e, success);
+}
+
+/* XXX todo: encrypt sensitive data with passphrase */
+static void
+process_lock_agent(SocketEntry *e, int lock)
+{
+	int r, success = 0;
+	char *passwd;
+
+	if ((r = sshbuf_get_cstring(e->request, &passwd, NULL)) != 0)
+		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+	if (locked && !lock && strcmp(passwd, lock_passwd) == 0) {
+		locked = 0;
+		memset(lock_passwd, 0, strlen(lock_passwd));
+		xfree(lock_passwd);
+		lock_passwd = NULL;
+		success = 1;
+	} else if (!locked && lock) {
+		locked = 1;
+		lock_passwd = xstrdup(passwd);
+		success = 1;
+	}
+	memset(passwd, 0, strlen(passwd));
+	xfree(passwd);
+	send_status(e, success);
+}
+
+static void
+no_identities(SocketEntry *e, u_int type)
+{
+	struct sshbuf *msg;
+	int r;
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal("%s: sshbuf_new failed", __func__);
+	if ((r = sshbuf_put_u8(msg,
+	    (type == SSH_AGENTC_REQUEST_RSA_IDENTITIES) ?
+	    SSH_AGENT_RSA_IDENTITIES_ANSWER :
+	    SSH2_AGENT_IDENTITIES_ANSWER)) != 0 ||
+	    (r = sshbuf_put_u32(msg, 0)) != 0 ||
+	    (r = sshbuf_put_stringb(e->output, msg)) != 0)
+		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+	sshbuf_free(msg);
+}
+
+#ifdef ENABLE_PKCS11
+static void
+process_add_smartcard_key(SocketEntry *e)
+{
+	char *provider = NULL, *pin;
+	int r, i, version, count = 0, success = 0, death = 0, confirm = 0;
+	u_char type;
+	struct sshkey **keys = NULL, *k;
+	Identity *id;
+	Idtab *tab;
+
+	if ((r = sshbuf_get_cstring(e->request, &provider, NULL)) != 0 ||
+	    (r = sshbuf_get_cstring(e->request, &pin, NULL)) != 0)
+		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+
+	while (sshbuf_len(e->request)) {
+		if ((r = sshbuf_get_u8(e->request, &type)) != 0)
+			fatal("%s: buffer error: %s", __func__, ssh_err(r));
+		switch (type) {
+		case SSH_AGENT_CONSTRAIN_LIFETIME:
+			if ((r = sshbuf_get_u32(e->request, &death)) != 0)
+				fatal("%s: buffer error: %s",
+				    __func__, ssh_err(r));
+			death += time(NULL);
+			break;
+		case SSH_AGENT_CONSTRAIN_CONFIRM:
+			confirm = 1;
+			break;
+		default:
+			error("process_add_smartcard_key: "
+			    "Unknown constraint type %d", type);
+			goto send;
+		}
+	}
+	if (lifetime && !death)
+		death = time(NULL) + lifetime;
+
+	count = pkcs11_add_provider(provider, pin, &keys);
+	for (i = 0; i < count; i++) {
+		k = keys[i];
+		version = k->type == KEY_RSA1 ? 1 : 2;
+		tab = idtab_lookup(version);
+		if (lookup_identity(k, version) == NULL) {
+			id = xcalloc(1, sizeof(Identity));
+			id->key = k;
+			id->provider = xstrdup(provider);
+			id->comment = xstrdup(provider); /* XXX */
+			id->death = death;
+			id->confirm = confirm;
+			TAILQ_INSERT_TAIL(&tab->idlist, id, next);
+			tab->nentries++;
+			success = 1;
+		} else {
+			sshkey_free(k);
+		}
+		keys[i] = NULL;
+	}
+send:
+	if (pin)
+		xfree(pin);
+	if (provider)
+		xfree(provider);
+	if (keys)
+		xfree(keys);
+	send_status(e, success);
+}
+
+static void
+process_remove_smartcard_key(SocketEntry *e)
+{
+	char *provider = NULL, *pin = NULL;
+	int r, version, success = 0;
+	Identity *id, *nxt;
+	Idtab *tab;
+
+	if ((r = sshbuf_get_cstring(e->request, &provider, NULL)) != 0 ||
+	    (r = sshbuf_get_cstring(e->request, &pin, NULL)) != 0)
+		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+	xfree(pin);
+
+	for (version = 1; version < 3; version++) {
+		tab = idtab_lookup(version);
+		for (id = TAILQ_FIRST(&tab->idlist); id; id = nxt) {
+			nxt = TAILQ_NEXT(id, next);
+			if (!strcmp(provider, id->provider)) {
+				TAILQ_REMOVE(&tab->idlist, id, next);
+				free_identity(id);
+				tab->nentries--;
+			}
+		}
+	}
+	if (pkcs11_del_provider(provider) == 0)
+		success = 1;
+	else
+		error("process_remove_smartcard_key:"
+		    " pkcs11_del_provider failed");
+	xfree(provider);
+	send_status(e, success);
+}
+#endif /* ENABLE_PKCS11 */
+
+/* dispatch incoming messages */
+
+static void
+process_message(SocketEntry *e)
+{
+	u_int msg_len;
+	u_char type;
+	const char *cp;
+	int r;
+
+	if (sshbuf_len(e->input) < 5)
+		return;		/* Incomplete message. */
+	cp = sshbuf_ptr(e->input);
+	msg_len = PEEK_U32(cp);
+	if (msg_len > 256 * 1024) {
+		close_socket(e);
+		return;
+	}
+	if (sshbuf_len(e->input) < msg_len + 4)
+		return;
+
+	/* move the current input to e->request */
+	sshbuf_reset(e->request);
+	if ((r = sshbuf_get_stringb(e->input, e->request)) != 0 ||
+	    (r = sshbuf_get_u8(e->request, &type)) != 0)
+		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+
+	/* check wheter agent is locked */
+	if (locked && type != SSH_AGENTC_UNLOCK) {
+		sshbuf_reset(e->request);
+		switch (type) {
+		case SSH_AGENTC_REQUEST_RSA_IDENTITIES:
+		case SSH2_AGENTC_REQUEST_IDENTITIES:
+			/* send empty lists */
+			no_identities(e, type);
+			break;
+		default:
+			/* send a fail message for all other request types */
+			send_status(e, 0);
+		}
+		return;
+	}
+
+	debug("type %d", type);
+	switch (type) {
+	case SSH_AGENTC_LOCK:
+	case SSH_AGENTC_UNLOCK:
+		process_lock_agent(e, type == SSH_AGENTC_LOCK);
+		break;
+	/* ssh1 */
+	case SSH_AGENTC_RSA_CHALLENGE:
+		process_authentication_challenge1(e);
+		break;
+	case SSH_AGENTC_REQUEST_RSA_IDENTITIES:
+		process_request_identities(e, 1);
+		break;
+	case SSH_AGENTC_ADD_RSA_IDENTITY:
+	case SSH_AGENTC_ADD_RSA_ID_CONSTRAINED:
+		process_add_identity(e, 1);
+		break;
+	case SSH_AGENTC_REMOVE_RSA_IDENTITY:
+		process_remove_identity(e, 1);
+		break;
+	case SSH_AGENTC_REMOVE_ALL_RSA_IDENTITIES:
+		process_remove_all_identities(e, 1);
+		break;
+	/* ssh2 */
+	case SSH2_AGENTC_SIGN_REQUEST:
+		process_sign_request2(e);
+		break;
+	case SSH2_AGENTC_REQUEST_IDENTITIES:
+		process_request_identities(e, 2);
+		break;
+	case SSH2_AGENTC_ADD_IDENTITY:
+	case SSH2_AGENTC_ADD_ID_CONSTRAINED:
+		process_add_identity(e, 2);
+		break;
+	case SSH2_AGENTC_REMOVE_IDENTITY:
+		process_remove_identity(e, 2);
+		break;
+	case SSH2_AGENTC_REMOVE_ALL_IDENTITIES:
+		process_remove_all_identities(e, 2);
+		break;
+#ifdef ENABLE_PKCS11
+	case SSH_AGENTC_ADD_SMARTCARD_KEY:
+	case SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED:
+		process_add_smartcard_key(e);
+		break;
+	case SSH_AGENTC_REMOVE_SMARTCARD_KEY:
+		process_remove_smartcard_key(e);
+		break;
+#endif /* ENABLE_PKCS11 */
+	default:
+		/* Unknown message.  Respond with failure. */
+		error("Unknown message %d", type);
+		sshbuf_reset(e->request);
+		send_status(e, 0);
+		break;
+	}
+}
+
+static void
+new_socket(sock_type type, int fd)
+{
+	u_int i, old_alloc, new_alloc;
+
+	set_nonblock(fd);
+
+	if (fd > max_fd)
+		max_fd = fd;
+
+	for (i = 0; i < sockets_alloc; i++)
+		if (sockets[i].type == AUTH_UNUSED) {
+			sockets[i].fd = fd;
+			if ((sockets[i].input = sshbuf_new()) == NULL)
+				fatal("%s: sshbuf_new failed", __func__);
+			if ((sockets[i].output = sshbuf_new()) == NULL)
+				fatal("%s: sshbuf_new failed", __func__);
+			if ((sockets[i].request = sshbuf_new()) == NULL)
+				fatal("%s: sshbuf_new failed", __func__);
+			sockets[i].type = type;
+			return;
+		}
+	old_alloc = sockets_alloc;
+	new_alloc = sockets_alloc + 10;
+	sockets = xrealloc(sockets, new_alloc, sizeof(sockets[0]));
+	for (i = old_alloc; i < new_alloc; i++)
+		sockets[i].type = AUTH_UNUSED;
+	sockets_alloc = new_alloc;
+	sockets[old_alloc].fd = fd;
+	if ((sockets[old_alloc].input = sshbuf_new()) == NULL)
+		fatal("%s: sshbuf_new failed", __func__);
+	if ((sockets[old_alloc].output = sshbuf_new()) == NULL)
+		fatal("%s: sshbuf_new failed", __func__);
+	if ((sockets[old_alloc].request = sshbuf_new()) == NULL)
+		fatal("%s: sshbuf_new failed", __func__);
+	sockets[old_alloc].type = type;
+}
+
+static int
+prepare_select(fd_set **fdrp, fd_set **fdwp, int *fdl, u_int *nallocp,
+    struct timeval **tvpp)
+{
+	u_int i, sz, deadline;
+	int n = 0;
+	static struct timeval tv;
+
+	for (i = 0; i < sockets_alloc; i++) {
+		switch (sockets[i].type) {
+		case AUTH_SOCKET:
+		case AUTH_CONNECTION:
+			n = MAX(n, sockets[i].fd);
+			break;
+		case AUTH_UNUSED:
+			break;
+		default:
+			fatal("Unknown socket type %d", sockets[i].type);
+			break;
+		}
+	}
+
+	sz = howmany(n+1, NFDBITS) * sizeof(fd_mask);
+	if (*fdrp == NULL || sz > *nallocp) {
+		if (*fdrp)
+			xfree(*fdrp);
+		if (*fdwp)
+			xfree(*fdwp);
+		*fdrp = xmalloc(sz);
+		*fdwp = xmalloc(sz);
+		*nallocp = sz;
+	}
+	if (n < *fdl)
+		debug("XXX shrink: %d < %d", n, *fdl);
+	*fdl = n;
+	memset(*fdrp, 0, sz);
+	memset(*fdwp, 0, sz);
+
+	for (i = 0; i < sockets_alloc; i++) {
+		switch (sockets[i].type) {
+		case AUTH_SOCKET:
+		case AUTH_CONNECTION:
+			FD_SET(sockets[i].fd, *fdrp);
+			if (sshbuf_len(sockets[i].output) > 0)
+				FD_SET(sockets[i].fd, *fdwp);
+			break;
+		default:
+			break;
+		}
+	}
+	deadline = reaper();
+	if (parent_alive_interval != 0)
+		deadline = (deadline == 0) ? parent_alive_interval :
+		    MIN(deadline, parent_alive_interval);
+	if (deadline == 0) {
+		*tvpp = NULL;
+	} else {
+		tv.tv_sec = deadline;
+		tv.tv_usec = 0;
+		*tvpp = &tv;
+	}
+	return (1);
+}
+
+static void
+after_select(fd_set *readset, fd_set *writeset)
+{
+	struct sockaddr_un sunaddr;
+	socklen_t slen;
+	char buf[1024];
+	int len, sock, r;
+	u_int i, orig_alloc;
+	uid_t euid;
+	gid_t egid;
+
+	for (i = 0, orig_alloc = sockets_alloc; i < orig_alloc; i++)
+		switch (sockets[i].type) {
+		case AUTH_UNUSED:
+			break;
+		case AUTH_SOCKET:
+			if (FD_ISSET(sockets[i].fd, readset)) {
+				slen = sizeof(sunaddr);
+				sock = accept(sockets[i].fd,
+				    (struct sockaddr *)&sunaddr, &slen);
+				if (sock < 0) {
+					error("accept from AUTH_SOCKET: %s",
+					    strerror(errno));
+					break;
+				}
+				if (getpeereid(sock, &euid, &egid) < 0) {
+					error("getpeereid %d failed: %s",
+					    sock, strerror(errno));
+					close(sock);
+					break;
+				}
+				if ((euid != 0) && (getuid() != euid)) {
+					error("uid mismatch: "
+					    "peer euid %u != uid %u",
+					    (u_int) euid, (u_int) getuid());
+					close(sock);
+					break;
+				}
+				new_socket(AUTH_CONNECTION, sock);
+			}
+			break;
+		case AUTH_CONNECTION:
+			if (sshbuf_len(sockets[i].output) > 0 &&
+			    FD_ISSET(sockets[i].fd, writeset)) {
+				len = write(sockets[i].fd,
+				    sshbuf_ptr(sockets[i].output),
+				    sshbuf_len(sockets[i].output));
+				if (len == -1 && (errno == EAGAIN ||
+				    errno == EINTR))
+					continue;
+				if (len <= 0) {
+					close_socket(&sockets[i]);
+					break;
+				}
+				if ((r = sshbuf_consume(sockets[i].output,
+				    len)) != 0)
+					fatal("%s: buffer error: %s",
+					    __func__, ssh_err(r));
+			}
+			if (FD_ISSET(sockets[i].fd, readset)) {
+				len = read(sockets[i].fd, buf, sizeof(buf));
+				if (len == -1 && (errno == EAGAIN ||
+				    errno == EINTR))
+					continue;
+				if (len <= 0) {
+					close_socket(&sockets[i]);
+					break;
+				}
+				if ((r = sshbuf_put(sockets[i].input,
+				    buf, len)) != 0)
+					fatal("%s: buffer error: %s",
+					    __func__, ssh_err(r));
+				process_message(&sockets[i]);
+			}
+			break;
+		default:
+			fatal("Unknown type %d", sockets[i].type);
+		}
+}
+
+static void
+cleanup_socket(void)
+{
+	if (socket_name[0])
+		unlink(socket_name);
+	if (socket_dir[0])
+		rmdir(socket_dir);
+}
+
+void
+cleanup_exit(int i)
+{
+	cleanup_socket();
+	_exit(i);
+}
+
+/*ARGSUSED*/
+static void
+cleanup_handler(int sig)
+{
+	cleanup_socket();
+#ifdef ENABLE_PKCS11
+	pkcs11_terminate();
+#endif
+	_exit(2);
+}
+
+static void
+check_parent_exists(void)
+{
+	/*
+	 * If our parent has exited then getppid() will return (pid_t)1,
+	 * so testing for that should be safe.
+	 */
+	if (parent_pid != -1 && getppid() != parent_pid) {
+		/* printf("Parent has died - Authentication agent exiting.\n"); */
+		cleanup_socket();
+		_exit(2);
+	}
+}
+
+static void
+usage(void)
+{
+	fprintf(stderr, "usage: %s [options] [command [arg ...]]\n",
+	    __progname);
+	fprintf(stderr, "Options:\n");
+	fprintf(stderr, "  -c          Generate C-shell commands on stdout.\n");
+	fprintf(stderr, "  -s          Generate Bourne shell commands on stdout.\n");
+	fprintf(stderr, "  -k          Kill the current agent.\n");
+	fprintf(stderr, "  -d          Debug mode.\n");
+	fprintf(stderr, "  -a socket   Bind agent socket to given name.\n");
+	fprintf(stderr, "  -t life     Default identity lifetime (seconds).\n");
+	exit(1);
+}
+
+int
+main(int ac, char **av)
+{
+	int c_flag = 0, d_flag = 0, k_flag = 0, s_flag = 0;
+	int sock, fd, ch, result, saved_errno;
+	u_int nalloc;
+	char *shell, *format, *pidstr, *agentsocket = NULL;
+	fd_set *readsetp = NULL, *writesetp = NULL;
+	struct sockaddr_un sunaddr;
+	struct rlimit rlim;
+	extern int optind;
+	extern char *optarg;
+	pid_t pid;
+	char pidstrbuf[1 + 3 * sizeof pid];
+	struct timeval *tvp = NULL;
+	size_t len;
+
+	/* Ensure that fds 0, 1 and 2 are open or directed to /dev/null */
+	sanitise_stdfd();
+
+	/* drop */
+	setegid(getgid());
+	setgid(getgid());
+
+	OpenSSL_add_all_algorithms();
+
+	while ((ch = getopt(ac, av, "cdksa:t:")) != -1) {
+		switch (ch) {
+		case 'c':
+			if (s_flag)
+				usage();
+			c_flag++;
+			break;
+		case 'k':
+			k_flag++;
+			break;
+		case 's':
+			if (c_flag)
+				usage();
+			s_flag++;
+			break;
+		case 'd':
+			if (d_flag)
+				usage();
+			d_flag++;
+			break;
+		case 'a':
+			agentsocket = optarg;
+			break;
+		case 't':
+			if ((lifetime = convtime(optarg)) == -1) {
+				fprintf(stderr, "Invalid lifetime\n");
+				usage();
+			}
+			break;
+		default:
+			usage();
+		}
+	}
+	ac -= optind;
+	av += optind;
+
+	if (ac > 0 && (c_flag || k_flag || s_flag || d_flag))
+		usage();
+
+	if (ac == 0 && !c_flag && !s_flag) {
+		shell = getenv("SHELL");
+		if (shell != NULL && (len = strlen(shell)) > 2 &&
+		    strncmp(shell + len - 3, "csh", 3) == 0)
+			c_flag = 1;
+	}
+	if (k_flag) {
+		const char *errstr = NULL;
+
+		pidstr = getenv(SSH_AGENTPID_ENV_NAME);
+		if (pidstr == NULL) {
+			fprintf(stderr, "%s not set, cannot kill agent\n",
+			    SSH_AGENTPID_ENV_NAME);
+			exit(1);
+		}
+		pid = (int)strtonum(pidstr, 2, INT_MAX, &errstr);
+		if (errstr) {
+			fprintf(stderr,
+			    "%s=\"%s\", which is not a good PID: %s\n",
+			    SSH_AGENTPID_ENV_NAME, pidstr, errstr);
+			exit(1);
+		}
+		if (kill(pid, SIGTERM) == -1) {
+			perror("kill");
+			exit(1);
+		}
+		format = c_flag ? "unsetenv %s;\n" : "unset %s;\n";
+		printf(format, SSH_AUTHSOCKET_ENV_NAME);
+		printf(format, SSH_AGENTPID_ENV_NAME);
+		printf("echo Agent pid %ld killed;\n", (long)pid);
+		exit(0);
+	}
+	parent_pid = getpid();
+
+	if (agentsocket == NULL) {
+		/* Create private directory for agent socket */
+		mktemp_proto(socket_dir, sizeof(socket_dir));
+		if (mkdtemp(socket_dir) == NULL) {
+			perror("mkdtemp: private socket dir");
+			exit(1);
+		}
+		snprintf(socket_name, sizeof socket_name, "%s/agent.%ld", socket_dir,
+		    (long)parent_pid);
+	} else {
+		/* Try to use specified agent socket */
+		socket_dir[0] = '\0';
+		strlcpy(socket_name, agentsocket, sizeof socket_name);
+	}
+
+	/*
+	 * Create socket early so it will exist before command gets run from
+	 * the parent.
+	 */
+	sock = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (sock < 0) {
+		perror("socket");
+		*socket_name = '\0'; /* Don't unlink any existing file */
+		cleanup_exit(1);
+	}
+	memset(&sunaddr, 0, sizeof(sunaddr));
+	sunaddr.sun_family = AF_UNIX;
+	strlcpy(sunaddr.sun_path, socket_name, sizeof(sunaddr.sun_path));
+	if (bind(sock, (struct sockaddr *)&sunaddr, sizeof(sunaddr)) < 0) {
+		perror("bind");
+		*socket_name = '\0'; /* Don't unlink any existing file */
+		cleanup_exit(1);
+	}
+	if (listen(sock, SSH_LISTEN_BACKLOG) < 0) {
+		perror("listen");
+		cleanup_exit(1);
+	}
+
+	/*
+	 * Fork, and have the parent execute the command, if any, or present
+	 * the socket data.  The child continues as the authentication agent.
+	 */
+	if (d_flag) {
+		log_init(__progname, SYSLOG_LEVEL_DEBUG1, SYSLOG_FACILITY_AUTH, 1);
+		format = c_flag ? "setenv %s %s;\n" : "%s=%s; export %s;\n";
+		printf(format, SSH_AUTHSOCKET_ENV_NAME, socket_name,
+		    SSH_AUTHSOCKET_ENV_NAME);
+		printf("echo Agent pid %ld;\n", (long)parent_pid);
+		goto skip;
+	}
+	pid = fork();
+	if (pid == -1) {
+		perror("fork");
+		cleanup_exit(1);
+	}
+	if (pid != 0) {		/* Parent - execute the given command. */
+		close(sock);
+		snprintf(pidstrbuf, sizeof pidstrbuf, "%ld", (long)pid);
+		if (ac == 0) {
+			format = c_flag ? "setenv %s %s;\n" : "%s=%s; export %s;\n";
+			printf(format, SSH_AUTHSOCKET_ENV_NAME, socket_name,
+			    SSH_AUTHSOCKET_ENV_NAME);
+			printf(format, SSH_AGENTPID_ENV_NAME, pidstrbuf,
+			    SSH_AGENTPID_ENV_NAME);
+			printf("echo Agent pid %ld;\n", (long)pid);
+			exit(0);
+		}
+		if (setenv(SSH_AUTHSOCKET_ENV_NAME, socket_name, 1) == -1 ||
+		    setenv(SSH_AGENTPID_ENV_NAME, pidstrbuf, 1) == -1) {
+			perror("setenv");
+			exit(1);
+		}
+		execvp(av[0], av);
+		perror(av[0]);
+		exit(1);
+	}
+	/* child */
+	log_init(__progname, SYSLOG_LEVEL_INFO, SYSLOG_FACILITY_AUTH, 0);
+
+	if (setsid() == -1) {
+		error("setsid: %s", strerror(errno));
+		cleanup_exit(1);
+	}
+
+	(void)chdir("/");
+	if ((fd = open(_PATH_DEVNULL, O_RDWR, 0)) != -1) {
+		/* XXX might close listen socket */
+		(void)dup2(fd, STDIN_FILENO);
+		(void)dup2(fd, STDOUT_FILENO);
+		(void)dup2(fd, STDERR_FILENO);
+		if (fd > 2)
+			close(fd);
+	}
+
+	/* deny core dumps, since memory contains unencrypted private keys */
+	rlim.rlim_cur = rlim.rlim_max = 0;
+	if (setrlimit(RLIMIT_CORE, &rlim) < 0) {
+		error("setrlimit RLIMIT_CORE: %s", strerror(errno));
+		cleanup_exit(1);
+	}
+
+skip:
+
+#ifdef ENABLE_PKCS11
+	pkcs11_init(0);
+#endif
+	new_socket(AUTH_SOCKET, sock);
+	if (ac > 0)
+		parent_alive_interval = 10;
+	idtab_init();
+	if (!d_flag)
+		signal(SIGINT, SIG_IGN);
+	signal(SIGPIPE, SIG_IGN);
+	signal(SIGHUP, cleanup_handler);
+	signal(SIGTERM, cleanup_handler);
+	nalloc = 0;
+
+	while (1) {
+		prepare_select(&readsetp, &writesetp, &max_fd, &nalloc, &tvp);
+		result = select(max_fd + 1, readsetp, writesetp, NULL, tvp);
+		saved_errno = errno;
+		if (parent_alive_interval != 0)
+			check_parent_exists();
+		(void) reaper();	/* remove expired keys */
+		if (result < 0) {
+			if (saved_errno == EINTR)
+				continue;
+			fatal("select: %s", strerror(saved_errno));
+		} else if (result > 0)
+			after_select(readsetp, writesetp);
+	}
+	/* NOTREACHED */
+}
